@@ -25,89 +25,116 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOAD_DIR),
-  filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+  filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
 const upload = multer({ storage });
 
 let documentText = "";
 
-/**
- * Extract text from PDFs (with scanned fallback) or images.
- */
 async function extractText(filePath) {
   const ext = path.extname(filePath).toLowerCase();
 
   if (ext === ".pdf") {
-    // 1) Try pdf-parse first
     const raw = fs.readFileSync(filePath);
     const { text: parsedText, info } = await pdfParse(raw);
-    if ((parsedText || "").trim().length > 50) {
+
+    if ((parsedText || "").trim().length > 500) {
       return parsedText;
     }
 
-    // 2) Fallback: scanned PDF → rasterize & OCR each page
-    console.log("Scanned PDF detected – falling back to pdftoppm+OCR…");
+    console.log("Scanned PDF detected – using enhanced OCR pipeline...");
 
     const pages = info.Pages || 1;
     const ocrPages = [];
+    const tempFiles = [];
 
-    for (let page = 1; page <= pages; page++) {
-      // create a unique prefix in temp
-      const prefix = path.join(os.tmpdir(), `scan-${Date.now()}-${page}`);
-      // pdftoppm flags:
-      // -png         → output PNG
-      // -singlefile  → no "-1" suffix
-      // -r 300       → 300 DPI
-      // -f, -l       → first & last page = this page
-      await execFileAsync("pdftoppm", [
-        "-png",
-        "-singlefile",
-        "-r",
-        "300",
-        "-f",
-        `${page}`,
-        "-l",
-        `${page}`,
-        filePath,
-        prefix
-      ]);
+    try {
+      await Promise.all(
+        Array.from({ length: pages }).map(async (_, index) => {
+          const page = index + 1;
+          const prefix = path.join(os.tmpdir(), `scan-${Date.now()}-${page}`);
+          const pngPath = `${prefix}.png`;
 
-      const pngPath = `${prefix}.png`;
-      // preprocess with sharp
-      const imgBuf = await sharp(pngPath)
-        .grayscale()
-        .sharpen()
-        .normalize()
-        .toBuffer();
+          try {
+            await execFileAsync("pdftoppm", [
+              "-png",
+              "-singlefile",
+              "-r",
+              "400",
+              "-f",
+              `${page}`,
+              "-l",
+              `${page}`,
+              "-cropbox",
+              "-aa",
+              "yes",
+              "-aaVector",
+              "yes",
+              filePath,
+              prefix,
+            ]);
 
-      // OCR with Tesseract
-      const {
-        data: { text }
-      } = await Tesseract.recognize(imgBuf, "eng", {
-        logger: (m) => console.log(`Tesseract page ${page}:`, m)
+            tempFiles.push(pngPath);
+
+            const processedImage = await sharp(pngPath)
+              .greyscale()
+              .normalize({ upper: 90 })
+              .linear(1.1, -0.1)
+              .sharpen({ sigma: 1.2, flat: 1, jagged: 2 })
+              .threshold(128, { grayscale: true })
+              .negate()
+              .toBuffer();
+
+            const {
+              data: { text },
+            } = await Tesseract.recognize(processedImage, "eng", {
+              logger: (m) => console.log(`Tesseract page ${page}:`, m),
+              oem: 1,
+              psm: 6,
+              dpi: 400,
+              tessedit_char_whitelist:
+                "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.,-/$%()'\"&!?",
+              preserve_interword_spaces: "1",
+            });
+
+            ocrPages[page - 1] = text; // Maintain page order
+          } catch (err) {
+            console.error(`Error processing page ${page}:`, err);
+            ocrPages[page - 1] = ""; // Empty text for failed pages
+          }
+        })
+      );
+    } finally {
+      tempFiles.forEach((file) => {
+        try {
+          fs.unlinkSync(file);
+        } catch (err) {
+          console.error("Cleanup error:", err);
+        }
       });
-
-      ocrPages.push(text);
-      // remove temp PNG
-      fs.unlinkSync(pngPath);
     }
 
     return ocrPages.join("\n\n");
   }
 
-  // === image support unchanged ===
   if ([".png", ".jpg", ".jpeg", ".bmp"].includes(ext)) {
-    const imgBuf = await sharp(filePath)
-      .grayscale()
-      .sharpen()
-      .normalize()
+    const processedImage = await sharp(filePath)
+      .greyscale()
+      .normalize({ upper: 95 })
+      .linear(1.2, -0.2)
+      .sharpen({ sigma: 1.5, flat: 1, jagged: 2 })
+      .threshold(140)
+      .negate()
       .toBuffer();
 
     const {
-      data: { text }
-    } = await Tesseract.recognize(imgBuf, "eng", {
-      logger: (m) => console.log("Tesseract:", m)
+      data: { text },
+    } = await Tesseract.recognize(processedImage, "eng", {
+      oem: 1,
+      psm: 3,
+      dpi: 300,
     });
+
     return text;
   }
 
@@ -122,9 +149,9 @@ async function askGemini(prompt) {
 
 function detectRequestedFormat(question) {
   const q = question.toLowerCase();
-  if (q.includes("table"))    return "table";
-  if (q.includes("json"))     return "json";
-  if (q.includes("bullet"))   return "bullets";
+  if (q.includes("table")) return "table";
+  if (q.includes("json")) return "json";
+  if (q.includes("bullet")) return "bullets";
   return "default";
 }
 
@@ -152,20 +179,57 @@ app.post("/chat", async (req, res) => {
     return res.status(400).json({ error: "Question cannot be empty." });
   }
 
-  const format = detectRequestedFormat(question);
-  let instruction;
-  switch (format) {
-    case "table":
-      instruction = "Respond strictly as a GitHub-Flavored Markdown table with header row and pipes.";
-      break;
-    case "json":
-      instruction = "Respond strictly as valid JSON." ;
-      break;
-    case "bullets":
-      instruction = "Respond as bullet points.";
-      break;
-    default:
-      instruction = "Respond in well-formatted Markdown.";
+  const isChecklist = question.toLowerCase().includes("checklist");
+  const basicFormat = detectRequestedFormat(question);
+
+  const format =
+    isChecklist && basicFormat === "table"
+      ? "checklist-table"
+      : isChecklist
+      ? "checklist-json"
+      : basicFormat;
+
+  let instruction = "";
+
+  if (format === "checklist-table") {
+    instruction = `
+Provide a SPECIFIC answer to the question as a detailed RBI compliance checklist in **Respond strictly as a GitHub-Flavored Markdown table with header row and pipes** format.
+Focus ONLY on the requirements mentioned in the question. Include these columns ONLY if relevant:
+- title
+- description
+- activities
+- periodicity
+- regulation_reference
+- action
+- complianceType
+- status`.trim();
+  } else if (format === "checklist-json") {
+    instruction = `
+Provide a SPECIFIC answer to the question as a detailed RBI compliance checklist in **JSON** format.
+Focus ONLY on the requirements mentioned in the question. Include these fields ONLY if relevant:
+- "title"
+- "description"
+- "activities"
+- "periodicity"
+- "regulation_reference"
+- "action"
+- "complianceType"
+- "status"`.trim();
+  } else {
+    switch (format) {
+      case "table":
+        instruction =
+          "Respond strictly as a GitHub-Flavored Markdown table with header row and pipes.";
+        break;
+      case "json":
+        instruction = "Respond strictly as valid JSON.";
+        break;
+      case "bullets":
+        instruction = "Respond as bullet points.";
+        break;
+      default:
+        instruction = "Respond in well-formatted Markdown.";
+    }
   }
 
   const prompt = `
@@ -188,7 +252,6 @@ ${instruction}`;
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`));
-
-
-Provide a SPECIFIC answer to the question as a detailed RBI compliance checklist in JSON format. Focus ONLY on the requirements mentioned in the question. Include these fields ONLY if relevant: - `title`: Brief descriptive name - `description`: Detailed requirement SPECIFIC to the question - `activities`: Array of specific activities needed - `periodicity`: How often it must be performed - `regulation_reference`: RBI circular/master direction reference- `action`: 'Actionable' or 'Informational' - `complianceType`: Array of compliance types - `status`: Compliance status 
+app.listen(PORT, () =>
+  console.log(`Backend listening on http://localhost:${PORT}`)
+);
